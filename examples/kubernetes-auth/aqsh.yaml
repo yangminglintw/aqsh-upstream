@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aqsh-api
+  namespace: aqsh
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aqsh-token-reviewer
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - nonResourceURLs: [/openid/v1/jwks]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aqsh-token-reviewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aqsh-token-reviewer
+subjects:
+  - kind: ServiceAccount
+    name: aqsh-api
+    namespace: aqsh
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aqsh-worker
+  namespace: aqsh
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aqsh-auth
+  namespace: aqsh
+data:
+  auth.yaml: |
+    audiences: [aqsh]
+    request_timeout: 5s
+    clusters:
+      local:
+        api_server: https://kubernetes.default.svc
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aqsh-api
+  namespace: aqsh
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: aqsh-api}
+  template:
+    metadata:
+      labels: {app: aqsh-api}
+    spec:
+      serviceAccountName: aqsh-api
+      containers:
+        - name: aqsh
+          image: aqsh:auth-integration
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: AQSH_MODE, value: api}
+            - {name: AQSH_AUTH_MODE, value: kubernetes}
+            - {name: AQSH_AUTH_CONFIG, value: /etc/aqsh/auth/auth.yaml}
+            - {name: AQSH_REDIS_ADDR, value: "redis:6379"}
+            - {name: AQSH_WORKER_QUEUES, value: "default,long-running"}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+          volumeMounts:
+            - {name: tasks, mountPath: /etc/aqsh, readOnly: true}
+            - {name: auth, mountPath: /etc/aqsh/auth, readOnly: true}
+      volumes:
+        - name: tasks
+          configMap: {name: aqsh-tasks-config}
+        - name: auth
+          configMap: {name: aqsh-auth}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aqsh-worker
+  namespace: aqsh
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: aqsh-worker}
+  template:
+    metadata:
+      labels: {app: aqsh-worker}
+    spec:
+      serviceAccountName: aqsh-worker
+      automountServiceAccountToken: false
+      containers:
+        - name: aqsh
+          image: aqsh:auth-integration
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: AQSH_MODE, value: worker}
+            - {name: AQSH_REDIS_ADDR, value: "redis:6379"}
+            - {name: AQSH_WORKER_QUEUES, value: "default,long-running"}
+          volumeMounts:
+            - {name: tasks, mountPath: /etc/aqsh, readOnly: true}
+            - {name: scripts, mountPath: /tasks, readOnly: true}
+      volumes:
+        - name: tasks
+          configMap: {name: aqsh-tasks-config}
+        - name: scripts
+          configMap: {name: aqsh-task-scripts, defaultMode: 0755}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aqsh
+  namespace: aqsh
+spec:
+  selector: {app: aqsh-api}
+  ports:
+    - {port: 8080, targetPort: http}

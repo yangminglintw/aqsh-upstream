@@ -1,20 +1,17 @@
 package auth
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"github.com/go-jose/go-jose/v4"
-	"io"
 	"net/http"
 	"os"
 	"slices"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/go-jose/go-jose/v4"
 )
 
 type Kubernetes struct {
@@ -23,6 +20,7 @@ type Kubernetes struct {
 	audienceKey string
 	timeout     time.Duration
 	cache       *reviewCache
+	credentials *credentialManager
 }
 
 type cluster struct {
@@ -30,6 +28,7 @@ type cluster struct {
 	config ClusterConfig
 	client *http.Client
 	keys   *keyCache
+	tokens *tokenSource
 }
 
 type tokenReview struct {
@@ -54,6 +53,17 @@ type userInfo struct {
 }
 
 func New(cfg Config) (*Kubernetes, error) {
+	// Freeze caller-owned maps, slices and renewal settings before applying defaults.
+	clusters := make(map[string]ClusterConfig, len(cfg.Clusters))
+	for id, c := range cfg.Clusters {
+		if c.Renewal != nil {
+			r := *c.Renewal
+			r.Audiences = append([]string(nil), r.Audiences...)
+			c.Renewal = &r
+		}
+		clusters[id] = c
+	}
+	cfg.Clusters = clusters
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -78,24 +88,35 @@ func New(cfg Config) (*Kubernetes, error) {
 			k.Close()
 			return nil, fmt.Errorf("cluster %q: %w", id, err)
 		}
-		k.clusters = append(k.clusters, &cluster{id: id, config: cc, client: client, keys: &keyCache{}})
+		k.clusters = append(k.clusters, &cluster{id: id, config: cc, client: client, keys: &keyCache{}, tokens: &tokenSource{path: cc.TokenFile}})
+	}
+	for _, c := range k.clusters {
+		if c.config.Renewal != nil {
+			k.credentials = &credentialManager{interval: cfg.RenewalInterval}
+			break
+		}
+	}
+	if p := cfg.Persistence; p != nil {
+		client, err := newClient(p.CAFile, cfg)
+		if err != nil {
+			k.Close()
+			return nil, err
+		}
+		if _, err := readToken(p.TokenFile); err != nil {
+			client.CloseIdleConnections()
+			k.Close()
+			return nil, err
+		}
+		k.credentials.storage = &cluster{config: ClusterConfig{APIServer: p.APIServer}, client: client, tokens: &tokenSource{path: p.TokenFile}}
+		k.credentials.path = "/api/v1/namespaces/" + p.Namespace + "/secrets/" + p.Secret
 	}
 	return k, nil
 }
 
 func newClient(caFile string, cfg Config) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	if caFile != "" {
-		ca, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(ca) {
-			return nil, fmt.Errorf("invalid CA certificate")
-		}
-		transport.TLSClientConfig.RootCAs = pool
+	transport := &fileTransport{path: caFile}
+	if _, err := transport.transport(); err != nil {
+		return nil, err
 	}
 	return &http.Client{
 		Transport: transport,
@@ -137,30 +158,16 @@ func (k *Kubernetes) Authenticate(ctx context.Context, token string) (Principal,
 }
 
 func (k *Kubernetes) review(ctx context.Context, c *cluster, token string) (Principal, error) {
-	reviewer, err := readToken(c.config.TokenFile)
+	reviewer, err := c.tokens.token()
 	if err != nil {
 		return Principal{}, ErrUnavailable
 	}
 	tr := tokenReview{APIVersion: "authentication.k8s.io/v1", Kind: "TokenReview"}
 	tr.Spec.Token, tr.Spec.Audiences = token, k.audiences
 	body, _ := json.Marshal(tr)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.config.APIServer, "/")+"/apis/authentication.k8s.io/v1/tokenreviews", bytes.NewReader(body))
-	if err != nil {
-		return Principal{}, ErrUnavailable
-	}
-	req.Header.Set("Authorization", "Bearer "+reviewer)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return Principal{}, ErrUnavailable
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Principal{}, ErrUnavailable
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	data, err := c.call(ctx, http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", "application/json", body, reviewer)
 	var result tokenReview
-	if err != nil || len(data) > 1<<20 || json.Unmarshal(data, &result) != nil {
+	if err != nil || json.Unmarshal(data, &result) != nil {
 		return Principal{}, ErrUnavailable
 	}
 	status := result.Status
@@ -181,6 +188,15 @@ func (k *Kubernetes) review(ctx context.Context, c *cluster, token string) (Prin
 }
 
 func (k *Kubernetes) Close() {
+	if m := k.credentials; m != nil {
+		if m.cancel != nil {
+			m.cancel()
+			<-m.done
+		}
+		if m.storage != nil {
+			m.storage.client.CloseIdleConnections()
+		}
+	}
 	for _, c := range k.clusters {
 		c.client.CloseIdleConnections()
 	}

@@ -114,3 +114,36 @@ func TestNativeRouterProtectsAllApplicationEndpoints(t *testing.T) {
 		t.Fatal(w.Code)
 	}
 }
+
+func TestAPIServerShutdown(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+	s := New(&config.Config{Mode: "api", Bind: "127.0.0.1:0"}, &tasks.TasksConfig{}, rdb, asynq.RedisClientOpt{Addr: mr.Addr()}, "test")
+	defer s.client.Close()
+	defer s.inspector.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	// Queue registration happens before the listener starts; cancellation also
+	// covers cancellation during startup, without relying on an arbitrary port.
+	deadline := time.After(time.Second)
+	for !mr.Exists("asynq:queues") {
+		select {
+		case <-deadline:
+			t.Fatal("API did not start")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("API did not shut down")
+	}
+}

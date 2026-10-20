@@ -90,7 +90,7 @@ func (c *cluster) loadKeys(ctx context.Context, force bool) ([]jose.JSONWebKey, 
 }
 
 func (c *cluster) fetchKeys(ctx context.Context) ([]jose.JSONWebKey, error) {
-	reviewer, err := readToken(c.config.TokenFile)
+	reviewer, err := c.tokens.token()
 	if err != nil {
 		return nil, ErrUnavailable
 	}

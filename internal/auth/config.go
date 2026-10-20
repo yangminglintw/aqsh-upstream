@@ -2,8 +2,10 @@ package auth
 
 import (
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -11,18 +13,21 @@ import (
 )
 
 type Config struct {
-	Audiences      []string                 `yaml:"audiences"`
-	CacheTTL       time.Duration            `yaml:"cache_ttl"`
-	CacheSize      int                      `yaml:"cache_size"`
-	RequestTimeout time.Duration            `yaml:"request_timeout"`
-	Clusters       map[string]ClusterConfig `yaml:"clusters"`
+	RenewalInterval time.Duration            `yaml:"renewal_interval"`
+	Persistence     *PersistenceConfig       `yaml:"persistence"`
+	Audiences       []string                 `yaml:"audiences"`
+	CacheTTL        time.Duration            `yaml:"cache_ttl"`
+	CacheSize       int                      `yaml:"cache_size"`
+	RequestTimeout  time.Duration            `yaml:"request_timeout"`
+	Clusters        map[string]ClusterConfig `yaml:"clusters"`
 }
 
 type ClusterConfig struct {
-	APIServer string `yaml:"api_server"`
-	JWKSURL   string `yaml:"jwks_url"`
-	CAFile    string `yaml:"ca_file"`
-	TokenFile string `yaml:"token_file"`
+	Renewal   *RenewalConfig `yaml:"renewal"`
+	APIServer string         `yaml:"api_server"`
+	JWKSURL   string         `yaml:"jwks_url"`
+	CAFile    string         `yaml:"ca_file"`
+	TokenFile string         `yaml:"token_file"`
 }
 
 func Load(path string) (Config, error) {
@@ -36,6 +41,10 @@ func Load(path string) (Config, error) {
 	d.KnownFields(true)
 	if err := d.Decode(&cfg); err != nil {
 		return cfg, err
+	}
+	var extra any
+	if err := d.Decode(&extra); err != io.EOF {
+		return cfg, fmt.Errorf("authentication config must contain one YAML document")
 	}
 	return cfg, nil
 }
@@ -67,9 +76,36 @@ func (c *Config) validate() error {
 	if c.CacheSize < 1 || c.CacheSize > 10000 {
 		return fmt.Errorf("cache_size must be between 1 and 10000")
 	}
+	if c.RenewalInterval == 0 {
+		c.RenewalInterval = time.Minute
+	}
+	if c.RenewalInterval < time.Second || c.RenewalInterval > time.Hour {
+		return fmt.Errorf("renewal_interval must be between 1s and 1h")
+	}
+	managed := false
 	for id, cluster := range c.Clusters {
 		if strings.TrimSpace(id) != id || id == "" || cluster.TokenFile == "" {
 			return fmt.Errorf("each cluster requires a stable ID and token_file")
+		}
+		if r := cluster.Renewal; r != nil {
+			managed = true
+			if !resourceName(id) || !resourceName(r.Namespace) || !resourceName(r.ServiceAccount) || len(r.Audiences) == 0 {
+				return fmt.Errorf("cluster %q renewal requires valid names and reviewer audiences", id)
+			}
+			for _, a := range r.Audiences {
+				if strings.TrimSpace(a) != a || a == "" {
+					return fmt.Errorf("invalid reviewer audience")
+				}
+			}
+			if r.TokenDuration == 0 {
+				r.TokenDuration = time.Hour
+			}
+			if r.RenewBefore == 0 {
+				r.RenewBefore = 10 * time.Minute
+			}
+			if r.TokenDuration < 10*time.Minute || r.TokenDuration > 30*24*time.Hour || r.RenewBefore <= 0 || r.RenewBefore >= r.TokenDuration {
+				return fmt.Errorf("invalid renewal duration or threshold")
+			}
 		}
 		if len(c.Clusters) > 1 && cluster.JWKSURL == "" {
 			return fmt.Errorf("cluster %q requires jwks_url for federation", id)
@@ -85,8 +121,17 @@ func (c *Config) validate() error {
 			return fmt.Errorf("cluster %q requires an HTTPS api_server without credentials, query or fragment", id)
 		}
 	}
+	if p := c.Persistence; p != nil {
+		if !managed || !validEndpoint(p.APIServer) || p.TokenFile == "" || !resourceName(p.Namespace) || !resourceName(p.Secret) {
+			return fmt.Errorf("persistence requires managed renewal, an HTTPS API, token_file, namespace and Secret name")
+		}
+	}
 	return nil
 }
+
+var resourcePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
+
+func resourceName(value string) bool { return len(value) <= 63 && resourcePattern.MatchString(value) }
 
 func validEndpoint(raw string) bool {
 	u, err := url.Parse(raw)

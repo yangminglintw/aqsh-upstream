@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"runtime/coverage"
@@ -108,6 +110,10 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		defer kube.Close()
 		authenticator = kube
+		if err := kube.Start(ctx); err != nil {
+			return err
+		}
+
 	}
 	// Ensure all configured queues are registered in Redis
 	// This is needed for Inspector.GetTaskInfo to work
@@ -119,6 +125,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// Register asynq queue metrics collector
 	queueMetrics := asynqmetrics.NewQueueMetricsCollector(s.inspector)
 	prometheus.MustRegister(queueMetrics)
+	defer prometheus.Unregister(queueMetrics)
 
 	handler := s.handler(authenticator)
 
@@ -126,17 +133,31 @@ func (s *Server) Run(ctx context.Context) error {
 		Addr:              s.cfg.Bind,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
+	stopped := make(chan struct{})
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdownCtx)
+		defer close(shutdownDone)
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				srv.Close()
+			}
+		case <-stopped:
+		}
 	}()
-
 	slog.Info("API server listening", "addr", s.cfg.Bind)
-	return srv.ListenAndServe()
+	err := srv.ListenAndServe()
+	close(stopped)
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		<-shutdownDone
+		return nil
+	}
+	return err
 }
 
 func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
