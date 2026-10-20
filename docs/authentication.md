@@ -82,3 +82,56 @@ To roll back, restore the authenticating proxy route and explicitly select
 `trusted-header`. Ensure that callers cannot directly reach the header-trusting
 backend. This is a configuration migration; existing task definitions and shell
 scripts do not need to change.
+
+## Federated Kubernetes authentication
+
+Configure multiple trusted clusters in the same file. Each cluster requires an
+explicit `jwks_url` on the same HTTPS origin as its `api_server`, plus its own
+reviewer credential and CA. No token-supplied issuer/discovery URL is fetched.
+
+```yaml
+audiences: [aqsh]
+request_timeout: 5s
+cache_ttl: 0s
+cache_size: 1000
+clusters:
+  production-a:
+    api_server: https://api-a.example.com
+    jwks_url: https://api-a.example.com/openid/v1/jwks
+    ca_file: /etc/aqsh/auth/ca/a.pem
+    token_file: /etc/aqsh/auth/tokens/a
+  production-b:
+    api_server: https://api-b.example.com
+    jwks_url: https://api-b.example.com/openid/v1/jwks
+    ca_file: /etc/aqsh/auth/ca/b.pem
+    token_file: /etc/aqsh/auth/tokens/b
+```
+
+aqsh verifies the JWT against each configured cluster's JWKS to choose a unique
+source, checks `exp`/`nbf` when present, then sends the caller token **only** to
+that source's TokenReview API. TokenReview supplies the authoritative username,
+UID and groups. Matching JWKS signatures alone never authenticate a caller.
+Different clusters can use the same issuer or key ID; cluster identity comes from
+the configured trust domain and verified key. Shared signing keys across trusted
+clusters make routing ambiguous and are rejected before forwarding the token.
+Supported algorithms are RS256, ES256, ES384, ES512 and EdDSA.
+
+The reviewer also needs read access to `/openid/v1/jwks`. JWKS keys are cached per
+cluster for five minutes, with refresh on signature/key misses throttled to once
+per five seconds. A failed JWKS request returns 503 and is retried after a five
+second cooldown. An unavailable cluster can prevent unique routing and cause
+503 for other clusters too. The timeout bounds the complete authentication
+request, including routing and TokenReview.
+
+TokenReview caching is disabled by default. Optional `cache_ttl` accepts at most
+one minute; `cache_size` bounds retained entries (default 1000, maximum 10000).
+Only successful reviews are cached, keyed by cluster, SHA-256 token hash and the
+full configured audience set. Entries cannot outlive a JWT's `exp`. Enabling this
+cache delays observation of revoked tokens/deleted bound objects by up to the TTL;
+leave it disabled when every request needs an online revocation check.
+
+Trust only clusters whose authenticated users may access this aqsh instance.
+Existing task ACLs match raw usernames/groups, so identically named service
+accounts in different trusted clusters match the same ACL. Execution reads also
+retain their existing shared policy. The recorded cluster/UID are identity
+metadata, not per-cluster task authorization or execution isolation.

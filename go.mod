@@ -6,6 +6,7 @@ toolchain go1.24.11
 
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/hibiken/asynq v0.25.1
 	github.com/hibiken/asynq/x v0.0.0-20251110080853-ff887e1f8997
 	github.com/prometheus/client_golang v1.23.2
