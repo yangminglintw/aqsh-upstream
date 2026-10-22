@@ -1,5 +1,11 @@
 # Authentication
 
+The TokenReview implementation and its original tests are ported from
+[kube-auth-proxy 0.4.1](https://github.com/rophy/kube-auth-proxy/tree/bdc304cba135e919b9c95f4d7515958dec9624c5).
+See [source provenance](../internal/kubeauthproxy/UPSTREAM.md) for the pinned
+revision and the small embedding changes. aqsh owns the request middleware,
+Principal mapping and task authorization; it calls the existing TokenReview client.
+
 aqsh supports two explicit authentication modes. Existing deployments keep
 `AQSH_AUTH_MODE=trusted-header` by default. In that mode, an authenticating proxy
 must be the only caller able to reach the API; aqsh trusts its configured identity
@@ -65,11 +71,8 @@ reviewer token volumes or the same service account. Use separate Pods and servic
 accounts, and grant workers only the database/cluster permissions their tasks need.
 
 Projected reviewer tokens are read from `token_file` for every TokenReview so
-kubelet rotation is picked up without restarting the API. Mounted CA bundles are
-also checked for every outbound request. Changed bundles create a fresh TLS
-transport; unreadable or invalid bundles fail the request instead of retaining
-stale trust. Mount rotating files as directories rather than Kubernetes `subPath`
-mounts, which do not receive Secret/ConfigMap updates.
+kubelet rotation is picked up without restarting the API. CA files are loaded
+at startup in this version; restart the API after CA changes.
 
 ## Migrating from kube-auth-proxy
 
@@ -88,141 +91,95 @@ scripts do not need to change.
 
 ## Federated Kubernetes authentication
 
-Configure multiple trusted clusters in the same file. Each cluster requires an
-explicit `jwks_url` on the same HTTPS origin as its `api_server`, plus its own
-reviewer credential and CA. No token-supplied issuer/discovery URL is fetched.
+Federation directly embeds the existing `kube-federated-auth` handler, OIDC
+verifier, cache and credential store. Original source, tests, license and pinned
+source revision are in [internal/kubefederatedauth](../internal/kubefederatedauth/UPSTREAM.md).
+It does not start a second HTTP service or expose a TokenReview forwarding route.
+
+Point the aqsh authentication config at an existing federated-auth config:
 
 ```yaml
 audiences: [aqsh]
 request_timeout: 5s
-cache_ttl: 0s
-cache_size: 1000
+federation_config: /etc/aqsh/clusters.yaml
+```
+
+`clusters.yaml` retains the original schema:
+
+```yaml
+cache:
+  ttl: 0
+  max_entries: 0
 clusters:
   production-a:
+    issuer: https://api-a.example.com
     api_server: https://api-a.example.com
-    jwks_url: https://api-a.example.com/openid/v1/jwks
-    ca_file: /etc/aqsh/auth/ca/a.pem
-    token_file: /etc/aqsh/auth/tokens/a
+    ca_cert: /etc/aqsh/auth/ca/a.pem
+    token_path: /etc/aqsh/auth/tokens/a
   production-b:
+    issuer: https://api-b.example.com
     api_server: https://api-b.example.com
-    jwks_url: https://api-b.example.com/openid/v1/jwks
-    ca_file: /etc/aqsh/auth/ca/b.pem
-    token_file: /etc/aqsh/auth/tokens/b
+    ca_cert: /etc/aqsh/auth/ca/b.pem
+    token_path: /etc/aqsh/auth/tokens/b
 ```
 
-aqsh verifies the JWT against each configured cluster's JWKS to choose a unique
-source, checks `exp`/`nbf` when present, then sends the caller token **only** to
-that source's TokenReview API. TokenReview supplies the authoritative username,
-UID and groups. Matching JWKS signatures alone never authenticate a caller.
-Different clusters can use the same issuer or key ID; cluster identity comes from
-the configured trust domain and verified key. Shared signing keys across trusted
-clusters make routing ambiguous and are rejected before forwarding the token.
-Supported algorithms are RS256, ES256, ES384, ES512 and EdDSA.
+Use either the single-cluster `clusters` setting or `federation_config`.
+The original `authorized_clients` setting controls proxy-to-service HTTP callers;
+it must be empty for embedding. aqsh authenticates the actual caller token and
+applies its existing task ACLs. The original HTTP service is not exposed.
 
-The reviewer also needs read access to `/openid/v1/jwks`. JWKS keys are cached per
-cluster for five minutes, with refresh on signature/key misses throttled to once
-per five seconds. A failed JWKS request returns 503 and is retried after a five
-second cooldown. An unavailable cluster can prevent unique routing and cause
-503 for other clusters too. The timeout bounds the complete authentication
-request, including routing and TokenReview.
+The original verifier discovers JWKS from configured cluster endpoints, finds a
+matching cluster, then forwards TokenReview only to that cluster. It supports
+legacy service-account tokens and retains the original routing behavior, including
+its assumption that signing key IDs identify clusters. Use distinct signing keys
+and key IDs for trusted clusters. This port adds no new routing or cache policy.
+The verified TokenReview supplies the username, UID and groups; its cluster extra
+field supplies the recorded trust domain. A JWKS signature alone does not grant
+access. The aqsh audience and CSV-group checks apply to the returned identity.
 
-TokenReview caching is disabled by default. Optional `cache_ttl` accepts at most
-one minute; `cache_size` bounds retained entries (default 1000, maximum 10000).
-Only successful reviews are cached, keyed by cluster, SHA-256 token hash and the
-full configured audience set. Entries cannot outlive a JWT's `exp`. Enabling this
-cache delays observation of revoked tokens/deleted bound objects by up to the TTL;
-leave it disabled when every request needs an online revocation check.
+The example disables the original positive and negative review caches for online
+revocation checks. Omitting `cache` retains the original defaults (60-second
+positive TTL, 30-second negative TTL, 1000 entries per cluster). Enabling caching
+can delay observation of token revocation by its TTL. All callers in this API
+instance use its fixed configured audience set.
 
-Trust only clusters whose authenticated users may access this aqsh instance.
-Existing task ACLs match raw usernames/groups, so identically named service
-accounts in different trusted clusters match the same ACL. Execution reads also
-retain their existing shared policy. The recorded cluster/UID are identity
-metadata, not per-cluster task authorization or execution isolation.
+Federated credential renewal follows the original store behavior described below.
+CA changes require restarting the API.
+Trust only clusters whose users may access this instance: existing task ACLs match
+raw usernames/groups across clusters, and execution reads remain shared. Recorded
+cluster/UID metadata does not add task or execution isolation.
 
-## Optional managed reviewer renewal
+## Federated credential lifecycle
 
-Mounted/projected credentials need no Secret writes or TokenRequest permission.
-For a remote reviewer that cannot use kubelet-managed rotation, explicitly enable
-`renewal` on that cluster:
+The API starts the ported credential store's renewal loop and cancels/waits for it
+on shutdown. The existing federated-auth configuration controls the global loop:
 
 ```yaml
-renewal_interval: 1m
-clusters:
-  production-b:
-    api_server: https://api-b.example.com
-    jwks_url: https://api-b.example.com/openid/v1/jwks
-    ca_file: /etc/aqsh/auth/ca/b.pem
-    token_file: /etc/aqsh/auth/tokens/bootstrap-b
-    renewal:
-      namespace: aqsh-auth
-      service_account: aqsh-reviewer
-      audiences: [https://kubernetes.default.svc.cluster.local]
-      token_duration: 1h
-      renew_before: 10m
+renewal:
+  interval: 1h
+  token_duration: 168h
+  renew_before: 48h
 ```
 
-This is a fragment to combine with the audience/cluster configuration above.
-Set reviewer audiences to values accepted by that cluster's Kubernetes API;
-they are independent of the caller audiences. The reviewer needs `create` on the
-configured `serviceaccounts/token` subresource in its namespace, in addition to
-TokenReview/JWKS permissions. The namespace and service account are explicit
-configuration, not derived from unverified token claims.
+Mounted credentials are re-read from `token_path` when the existing expiry check
+says renewal is due. Persisted credentials use Kubernetes TokenRequest, deriving
+the namespace/service account from the reviewer's subject and using the API's
+default token audience. Bootstrap-file fallback, the `<cluster>-token` Secret key
+format and skipping pod-bound persisted tokens are preserved. After successful
+renewal, both OIDC verifiers and TokenReview clients are invalidated.
 
-The API checks token expiry once per interval (default one minute) and requests
-an unbound replacement before expiry. It reads the current credential for every
-outbound request, so long-lived TokenReview/JWKS clients use renewed tokens.
-If renewal fails, it retries with the current bootstrap file when that differs
-from the managed token, then retries on the next interval. Expired credentials
-are not used as an offline authentication fallback. Mount a renewable bootstrap
-credential for recovery; aqsh cannot recover if all reviewer credentials expire
-or lose their required RBAC. Renewal stops with the API context.
+To enable the original Secret persistence, add `secret_name: aqsh-auth-credentials`
+to aqsh's authentication file beside `federation_config`. The store uses the API
+Pod's in-cluster credentials and namespace. An empty name disables Secret access.
+It retains the original best-effort load/save behavior: Secret read failures are
+logged and bootstrap files remain available; renewal updates memory before saving.
+The Secret is dedicated to this store: its update/create path replaces its data,
+and does not promise preservation of unrelated Secret fields.
 
-For restart persistence, opt into an **existing**, dedicated Secret:
-
-```yaml
-persistence:
-  api_server: https://kubernetes.default.svc
-  ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-  token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
-  namespace: aqsh-auth
-  secret: aqsh-reviewer-tokens
-```
-
-Only the API service account needs `get` and `patch` on this named Secret. aqsh
-does not create Secrets, list/watch them, or replace unrelated keys. The Secret
-must already exist, even if empty. Managed cluster IDs use lowercase letters,
-digits, dots or hyphens (maximum 63 characters); tokens are stored under
-`<cluster-id>-token`. On startup, aqsh loads only configured managed entries,
-skipping expired, wrong-subject and Pod-bound tokens. A failed Secret read stops
-API startup. Successful renewal patches its own key before adopting the new
-credential. A failed write retains the previous snapshot and retries later.
-
-Use one active API replica for each managed reviewer Secret. Renewal has no
-distributed lease; multiple independent managers can overwrite the same key.
-Mounted-only mode supports multiple API replicas without this restriction.
-
-This mode gives the API reusable reviewer credentials; protect its Secret, RBAC,
-configuration and network access accordingly. Keep all of them out of worker Pods.
-See the [separate API/worker example](../examples/kubernetes-auth/README.md).
-
-## Migrating from kube-federated-auth
-
-The native API talks directly to each trusted Kubernetes API. It does not expose
-a public TokenReview forwarding endpoint, `/clusters` endpoint, or a second
-metrics listener. Existing aqsh `/health` and `/metrics` remain available.
-
-Map each old `clusters.<id>.ca_cert` to `ca_file` and `token_path` to `token_file`.
-Keep cluster IDs stable. Set an explicit `jwks_url` for every federated cluster
-and configure caller audiences explicitly. If reusing a persisted Secret, match
-its existing `<cluster-id>-token` keys and enable renewal for those entries.
-Old `authorized_clients` entries identified the intermediate proxy service;
-they are not task-user authorization and must not be copied as task ACLs.
-Review `allowed_users`/`allowed_groups` for the callers in all trusted clusters.
-
-After validating the direct API route and separating worker credentials, remove
-aqsh's dependency on the standalone federation service. Keep it deployed if other
-applications still use it. OAuth/MCP support and owner-only execution reads are
-separate changes.
-
-Kubernetes references: [service account token lifecycle](https://kubernetes.io/docs/concepts/security/service-accounts/)
-and [TokenRequest API](https://kubernetes.io/docs/reference/kubernetes-api/authentication-resources/token-request-v1/).
+Grant the API Pod `get`, `update` and `create` on Secrets in its namespace as needed
+by the existing store. Precreating the dedicated Secret avoids the create path;
+get/update can then be limited by resource name. The remote reviewer needs create
+on its own `serviceaccounts/token` subresource for persisted-token renewal, in
+addition to TokenReview and discovery/JWKS reads. No worker needs this RBAC.
+Use one active API replica per credential Secret, as there is no renewal lease.
+The deployment example leaves persistence disabled.

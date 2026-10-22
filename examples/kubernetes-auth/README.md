@@ -28,8 +28,9 @@ reviewer and each caller.
 To add a remote cluster, mount its CA and reviewer credential only in the API Pod
 and extend `auth.yaml` as described in [authentication](../../docs/authentication.md).
 Remote clusters need reviewer RBAC and reachable Kubernetes APIs, not another
-aqsh/auth service. Managed renewal and Secret persistence are optional and are not
-enabled by this example.
+aqsh/auth service. The embedded federated-auth store retains its original renewal settings and
+Secret format. This single-cluster example uses projected token-file rotation;
+Secret persistence is disabled.
 
 This example authenticates callers; it does not add execution owner isolation or
 per-cluster task ACLs. Confirm those policies before accepting mutually untrusted
